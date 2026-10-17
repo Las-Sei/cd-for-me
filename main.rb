@@ -1,6 +1,6 @@
 require "bundler/setup"
 
-require_relative 'usb_accessor'
+require_relative 'lib/usb_accessor'
 
 class Main
   def initialize
@@ -9,7 +9,6 @@ class Main
   end
   
   def start
-    puts @drives
     puts @mountpoints
   end
 end
