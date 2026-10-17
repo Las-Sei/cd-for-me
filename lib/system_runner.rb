@@ -14,7 +14,7 @@ module SystemRunner
   private
 
   def execute_command(verbose, *args)
-    puts *args.join(" ")
+    # puts *args.join(" ")
     stdin, stdout, stderr, wait_thr = Open3.popen3(*args.join(" ")) #ToDo Args müssten hier auch als array/enumerable gehen
     stdin.close
 
