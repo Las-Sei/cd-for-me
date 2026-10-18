@@ -3,6 +3,10 @@ require "open3"
 module SystemRunner
   extend self
 
+  def dry_run(*args)
+    puts args.join(" ")
+  end
+
   def run(*args)
     execute_command(false, args)
   end
@@ -15,7 +19,9 @@ module SystemRunner
 
   def execute_command(verbose, *args)
     # puts *args.join(" ")
-    stdin, stdout, stderr, wait_thr = Open3.popen3(*args.join(" ")) #ToDo Args müssten hier auch als array/enumerable gehen
+    dry_run(args)
+
+    stdin, stdout, stderr, wait_thr = Open3.popen3(*args.join(" ")) #ToDo Args müssten hier auch als array ohne string.join gehen
     stdin.close
 
     has_error = stderr.read != ""
