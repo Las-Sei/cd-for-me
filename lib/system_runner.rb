@@ -12,7 +12,30 @@ module SystemRunner
   end
 
   def run_verbose(*args)
-    execute_command(true, args)   
+    execute_command(true, args)
+  end
+
+  def run_live(*args, &block)
+    flat_args = args.flatten.map(&:to_s)
+    return false if flat_args.empty?
+
+    dry_run(flat_args)
+
+    Open3.popen2e(*flat_args) do |stdin, stdout_and_stderr, wait_thr|
+      stdin.close
+      stdout_and_stderr.each_line do |line|
+        if block_given?
+          block.call(line)
+        else
+          $stdout.print(line)
+          $stdout.flush
+        end
+      end
+      wait_thr.value.success?
+    end
+  rescue Errno::ENOENT => e
+    $stderr.puts("Command failed: #{e.message}")
+    false
   end
 
   def run_stream(*args, &block)

@@ -6,15 +6,17 @@ require "pathname"
 require "time"
 
 require_relative "usb_accessor"
+require_relative "yt_music_downloader"
 require_relative "system_runner"
 
 class GuiApp
   attr_reader :destination, :self_test
 
-  def initialize(destination: "~/Musik", self_test: false, accessor: UsbAccessor)
+  def initialize(destination: "~/Musik", self_test: false, accessor: UsbAccessor, downloader: YtMusicDownloader)
     @destination = destination || "~/Musik"
     @self_test = self_test
     @accessor = accessor
+    @downloader = downloader
     @ipc_mutex = Mutex.new
     @worker_thread = nil
     @self_test_passed = false
@@ -65,8 +67,34 @@ class GuiApp
     text = line.to_s.split("\r").last.to_s.strip
     return nil if text.empty?
 
+    # yt-dlp playlist item progress: "[download] Downloading item 3 of 12"
+    if (m = text.match(/\[download\]\s+Downloading\s+(?:item|video)\s+(\d+)\s+of\s+(\d+)/i))
+      current = m[1].to_f
+      total = [m[2].to_f, 1.0].max
+      return {
+        fraction: ((current - 1.0) / total).clamp(0.0, 1.0),
+        status: "Downloading track #{m[1]} of #{m[2]}"
+      }
+    # yt-dlp / rsync percentage: "[download]  45.2% of ..." or "45%"
+    elsif (m = text.match(/(\d{1,3}(?:\.\d+)?)%/))
+      pct = m[1].to_f / 100.0
+      return {
+        fraction: pct.clamp(0.0, 1.0),
+        status: text
+      }
+    # yt-dlp post-processing lines
+    elsif (m = text.match(/\[ExtractAudio\]\s+Destination:\s+(.+)/i))
+      return {
+        fraction: nil,
+        status: "Converting to MP3: #{File.basename(m[1].strip)}"
+      }
+    elsif (m = text.match(/\[Metadata\]\s+Adding metadata to\s+"?([^"]+)"?/i))
+      return {
+        fraction: nil,
+        status: "Embedding metadata: #{File.basename(m[1].strip)}"
+      }
     # abcde track encoding/tagging/reading patterns: "Encoding track 03 of 12" or "Grabbing track 02..."
-    if (m = text.match(/(?:Encoding|Tagging|Reading|Grabbing)\s+track\s+(\d+)\s+of\s+(\d+)/i))
+    elsif (m = text.match(/(?:Encoding|Tagging|Reading|Grabbing)\s+track\s+(\d+)\s+of\s+(\d+)/i))
       current = m[1].to_f
       total = [m[2].to_f, 1.0].max
       return {
@@ -86,12 +114,6 @@ class GuiApp
       return {
         fraction: (filled / total).clamp(0.0, 1.0),
         status: "cdparanoia sector #{sector}"
-      }
-    elsif (m = text.match(/(\d{1,3})%/))
-      pct = m[1].to_f / 100.0
-      return {
-        fraction: pct.clamp(0.0, 1.0),
-        status: text
       }
     elsif text.end_with?(".mp3") || text.start_with?("sending incremental")
       return {
@@ -139,6 +161,27 @@ class GuiApp
       else
         @worker_thread = Thread.new do
           execute_copy_job(prepared, dest, &emit)
+        end
+      end
+    when "start_yt_download"
+      url = cmd["url"].to_s.strip
+      dest = cmd["destination"].to_s.strip
+      dest = @destination if dest.empty?
+
+      unless @downloader.valid_url?(url)
+        emit.call({
+          "type" => "job_finished",
+          "success" => false,
+          "message" => "Invalid URL: Please enter a valid http:// or https:// YouTube Music URL."
+        })
+        return
+      end
+
+      if cmd["sync"]
+        execute_yt_download_job(url, dest, &emit)
+      else
+        @worker_thread = Thread.new do
+          execute_yt_download_job(url, dest, &emit)
         end
       end
     when "self_test_complete"
@@ -278,6 +321,79 @@ class GuiApp
     })
   end
 
+  def execute_yt_download_job(url, dest, &emit)
+    emit.call({
+      "type" => "job_started",
+      "total_drives" => 1,
+      "destination" => dest,
+      "message" => "Starting YouTube Music download from #{url}..."
+    })
+
+    success = @downloader.download(url: url, destination: dest) do |ev|
+      msg = ev[:message].to_s
+
+      case ev[:event]
+      when :start
+        emit.call({
+          "type" => "progress",
+          "event" => "drive_start",
+          "drive" => "YouTube Music",
+          "drive_index" => 1,
+          "total_drives" => 1,
+          "target_dir" => ev[:destination].to_s,
+          "fraction" => 0.0,
+          "message" => msg
+        })
+      when :log
+        parsed = self.class.parse_progress(msg)
+        emit.call({
+          "type" => "progress",
+          "event" => "log",
+          "drive" => "YouTube Music",
+          "drive_index" => 1,
+          "total_drives" => 1,
+          "fraction" => parsed ? parsed[:fraction] : nil,
+          "status_text" => parsed ? parsed[:status] : nil,
+          "message" => msg
+        })
+      when :done
+        emit.call({
+          "type" => "progress",
+          "event" => "drive_done",
+          "drive" => "YouTube Music",
+          "drive_index" => 1,
+          "total_drives" => 1,
+          "target_dir" => ev[:destination].to_s,
+          "fraction" => 1.0,
+          "message" => msg
+        })
+      when :error
+        emit.call({
+          "type" => "progress",
+          "event" => "error",
+          "drive" => "YouTube Music",
+          "drive_index" => 1,
+          "total_drives" => 1,
+          "target_dir" => ev[:destination].to_s,
+          "message" => msg
+        })
+      end
+    end
+
+    expanded_dest = Pathname.new(dest).expand_path
+    emit.call({
+      "type" => "job_finished",
+      "success" => !!success,
+      "message" => success ? "YouTube Music album downloaded to #{expanded_dest}." : "YouTube Music download failed."
+    })
+  rescue StandardError => e
+    emit.call({
+      "type" => "job_finished",
+      "success" => false,
+      "message" => "Error: #{e.message}"
+    })
+  end
+
   PYTHON_GTK_SCRIPT = <<~'PYTHON'
     import sys
     import os
@@ -288,12 +404,12 @@ class GuiApp
     import gi
     gi.require_version('Gtk', '4.0')
     gi.require_version('Adw', '1')
-    from gi.repository import Gtk, Adw, Gio, GLib, Pango
+    from gi.repository import Gtk, Adw, Gio, Gdk, GLib, Pango
 
     class CdForMeWindow(Adw.ApplicationWindow):
         def __init__(self, app, destination, self_test=False):
             super().__init__(application=app, title="CD For Me")
-            self.set_default_size(760, 620)
+            self.set_default_size(780, 650)
             self.destination = destination
             self.self_test = self_test
             self.is_busy = False
@@ -314,13 +430,15 @@ class GuiApp
             toolbar_view = Adw.ToolbarView()
             self.set_content(toolbar_view)
 
-            # HeaderBar
+            # ViewStack for switching between Optical CDs and YouTube Music
+            self.view_stack = Adw.ViewStack()
+
+            # HeaderBar with ViewSwitcher
             header = Adw.HeaderBar()
-            title_widget = Adw.WindowTitle(
-                title="CD For Me",
-                subtitle="Audio CD & MP3 CD Ripper / Copier"
-            )
-            header.set_title_widget(title_widget)
+            self.view_switcher = Adw.ViewSwitcher()
+            self.view_switcher.set_stack(self.view_stack)
+            self.view_switcher.set_policy(Adw.ViewSwitcherPolicy.WIDE)
+            header.set_title_widget(self.view_switcher)
 
             self.refresh_btn = Gtk.Button.new_with_mnemonic("_Refresh")
             self.refresh_btn.set_icon_name("view-refresh-symbolic")
@@ -345,7 +463,7 @@ class GuiApp
             scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
 
             clamp = Adw.Clamp()
-            clamp.set_maximum_size(700)
+            clamp.set_maximum_size(720)
             clamp.set_margin_top(16)
             clamp.set_margin_bottom(16)
             clamp.set_margin_start(16)
@@ -355,7 +473,7 @@ class GuiApp
             main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
             clamp.set_child(main_box)
 
-            # Destination section
+            # Shared Destination section
             dest_group = Adw.PreferencesGroup(
                 title="Destination Folder",
                 description="Target base directory (Destination / Author / Album)"
@@ -381,12 +499,16 @@ class GuiApp
             dest_row.add_suffix(dest_box)
             dest_group.add(dest_row)
 
-            # Drives section
+            # -------------------------------------------------------
+            # Page 1: Optical CDs (Audio CD & MP3 CD)
+            # -------------------------------------------------------
+            cd_page_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+
             self.drives_group = Adw.PreferencesGroup(
                 title="Detected Optical Drives",
                 description="Select drives to process and optionally enter Author and Album / Media Name."
             )
-            main_box.append(self.drives_group)
+            cd_page_box.append(self.drives_group)
 
             self.drives_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
             self.drives_group.add(self.drives_container)
@@ -395,7 +517,7 @@ class GuiApp
             self.empty_status = Adw.StatusPage(
                 icon_name="media-optical-symbolic",
                 title="No Audio or MP3 CDs Detected",
-                description="Insert an Audio CD or MP3 data disc and press Refresh (F5)."
+                description="Insert an Audio CD or MP3 data disc and press Refresh (F5), or switch to YouTube Music (Alt+2)."
             )
             empty_refresh_btn = Gtk.Button.new_with_mnemonic("_Refresh Drives (F5)")
             empty_refresh_btn.set_halign(Gtk.Align.CENTER)
@@ -403,6 +525,92 @@ class GuiApp
             empty_refresh_btn.connect("clicked", lambda *_: self.request_refresh())
             self.empty_status.set_child(empty_refresh_btn)
             self.drives_container.append(self.empty_status)
+
+            self.view_stack.add_titled_with_icon(
+                cd_page_box,
+                "cd",
+                "Optical CDs",
+                "media-optical-symbolic"
+            )
+
+            # -------------------------------------------------------
+            # Page 2: YouTube Music Album Downloader
+            # -------------------------------------------------------
+            yt_page_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+
+            yt_group = Adw.PreferencesGroup(
+                title="YouTube Music Album / Playlist",
+                description="Paste a YouTube Music album or playlist URL to download tracks in MP3 format."
+            )
+            yt_page_box.append(yt_group)
+
+            url_row = Adw.ActionRow(
+                title="Album / Playlist URL",
+                subtitle="Supports music.youtube.com and youtube.com album/playlist links"
+            )
+            self.yt_url_entry = Gtk.Entry()
+            self.yt_url_entry.set_hexpand(True)
+            self.yt_url_entry.set_valign(Gtk.Align.CENTER)
+            self.yt_url_entry.set_placeholder_text("https://music.youtube.com/playlist?list=...")
+            self.yt_url_entry.connect("activate", lambda *_: self.trigger_yt_download())
+
+            self.yt_paste_btn = Gtk.Button.new_with_mnemonic("_Paste")
+            self.yt_paste_btn.set_valign(Gtk.Align.CENTER)
+            self.yt_paste_btn.set_tooltip_text("Paste URL from clipboard (Alt+V)")
+            self.yt_paste_btn.connect("clicked", self._on_paste_url_clicked)
+
+            self.yt_clear_btn = Gtk.Button.new_from_icon_name("edit-clear-symbolic")
+            self.yt_clear_btn.set_valign(Gtk.Align.CENTER)
+            self.yt_clear_btn.set_tooltip_text("Clear URL field")
+            self.yt_clear_btn.connect("clicked", lambda *_: self.yt_url_entry.set_text(""))
+
+            url_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            url_box.set_hexpand(True)
+            url_box.append(self.yt_url_entry)
+            url_box.append(self.yt_paste_btn)
+            url_box.append(self.yt_clear_btn)
+            url_row.add_suffix(url_box)
+            yt_group.add(url_row)
+
+            action_row = Adw.ActionRow(
+                title="Download and Convert to MP3",
+                subtitle="Automatically names tracks via yt-dlp metadata and LAME V2 encoding"
+            )
+            self.yt_download_btn = Gtk.Button.new_with_mnemonic("_Download Album")
+            self.yt_download_btn.add_css_class("suggested-action")
+            self.yt_download_btn.set_valign(Gtk.Align.CENTER)
+            self.yt_download_btn.set_tooltip_text("Start downloading the YouTube Music album (Alt+D / Ctrl+Return)")
+            self.yt_download_btn.connect("clicked", lambda *_: self.trigger_yt_download())
+            action_row.add_suffix(self.yt_download_btn)
+            yt_group.add(action_row)
+
+            format_group = Adw.PreferencesGroup(
+                title="Output Format (.abcde.conf Compatible)",
+                description="Downloaded albums use the exact same directory hierarchy and MP3 settings as ripped CDs."
+            )
+            yt_page_box.append(format_group)
+
+            pattern_row = Adw.ActionRow(
+                title="Folder and Track Structure",
+                subtitle="[Destination]/[Artist]/[Album]/[TrackNum].[TrackTitle].mp3 (e.g. 01.Track.mp3)"
+            )
+            format_group.add(pattern_row)
+
+            codec_row = Adw.ActionRow(
+                title="Audio Encoding and Sanitization",
+                subtitle="MP3 VBR Quality 2 (LAME -V 2), embedded metadata, illegal characters stripped"
+            )
+            format_group.add(codec_row)
+
+            self.view_stack.add_titled_with_icon(
+                yt_page_box,
+                "yt_music",
+                "YouTube Music",
+                "audio-x-generic-symbolic"
+            )
+
+            self.view_stack.connect("notify::visible-child-name", self._on_mode_changed)
+            main_box.append(self.view_stack)
 
             toolbar_view.set_content(scrolled)
 
@@ -436,7 +644,7 @@ class GuiApp
             footer_box.append(self.progress_bar)
 
             # Expandable Live Log
-            self.log_expander = Gtk.Expander(label="Live Command Log (abcde / cdparanoia / rsync)")
+            self.log_expander = Gtk.Expander(label="Live Command Log (abcde / cdparanoia / rsync / yt-dlp)")
             log_scroll = Gtk.ScrolledWindow()
             log_scroll.set_min_content_height(150)
             log_scroll.set_vexpand(False)
@@ -457,22 +665,40 @@ class GuiApp
             controller = Gtk.ShortcutController()
             controller.set_scope(Gtk.ShortcutScope.MANAGED)
 
+            # Alt+1 -> Switch to Optical CDs mode
+            controller.add_shortcut(Gtk.Shortcut.new(
+                Gtk.ShortcutTrigger.parse_string("<Alt>1"),
+                Gtk.CallbackAction.new(lambda *_: self._switch_mode("cd"))
+            ))
+
+            # Alt+2 -> Switch to YouTube Music mode
+            controller.add_shortcut(Gtk.Shortcut.new(
+                Gtk.ShortcutTrigger.parse_string("<Alt>2"),
+                Gtk.CallbackAction.new(lambda *_: self._switch_mode("yt_music"))
+            ))
+
             # F5 / Ctrl+R -> Refresh
             controller.add_shortcut(Gtk.Shortcut.new(
                 Gtk.ShortcutTrigger.parse_string("F5|<Control>r"),
                 Gtk.CallbackAction.new(lambda *_: self._shortcut_refresh())
             ))
 
-            # Ctrl+Return / Ctrl+KP_Enter / Alt+a -> Copy / Rip All
+            # Ctrl+Return / Ctrl+KP_Enter / Alt+a -> Primary action for active tab
             controller.add_shortcut(Gtk.Shortcut.new(
                 Gtk.ShortcutTrigger.parse_string("<Control>Return|<Control>KP_Enter|<Alt>a"),
-                Gtk.CallbackAction.new(lambda *_: self._shortcut_copy_all())
+                Gtk.CallbackAction.new(lambda *_: self._shortcut_primary_action())
             ))
 
-            # Alt+s -> Start Selected
+            # Alt+s -> Start Selected (Optical CDs)
             controller.add_shortcut(Gtk.Shortcut.new(
                 Gtk.ShortcutTrigger.parse_string("<Alt>s"),
                 Gtk.CallbackAction.new(lambda *_: self._shortcut_start_selected())
+            ))
+
+            # Alt+d -> Download Album (YouTube Music)
+            controller.add_shortcut(Gtk.Shortcut.new(
+                Gtk.ShortcutTrigger.parse_string("<Alt>d"),
+                Gtk.CallbackAction.new(lambda *_: self._shortcut_yt_download())
             ))
 
             # Ctrl+q / Escape -> Quit when idle
@@ -483,19 +709,41 @@ class GuiApp
 
             self.add_controller(controller)
 
+        def _switch_mode(self, mode_name):
+            self.view_stack.set_visible_child_name(mode_name)
+            if mode_name == "yt_music":
+                self.yt_url_entry.grab_focus()
+            return True
+
+        def _on_mode_changed(self, stack, _param):
+            is_cd = stack.get_visible_child_name() == "cd"
+            self.refresh_btn.set_visible(is_cd)
+            self.copy_all_btn.set_visible(is_cd)
+            self.start_selected_btn.set_visible(is_cd)
+
         def _shortcut_refresh(self):
             if not self.is_busy:
                 self.request_refresh()
             return True
 
-        def _shortcut_copy_all(self):
-            if not self.is_busy:
+        def _shortcut_primary_action(self):
+            if self.is_busy:
+                return True
+            if self.view_stack.get_visible_child_name() == "yt_music":
+                self.trigger_yt_download()
+            else:
                 self.trigger_copy_all()
             return True
 
         def _shortcut_start_selected(self):
-            if not self.is_busy:
+            if not self.is_busy and self.view_stack.get_visible_child_name() == "cd":
                 self.trigger_start_selected()
+            return True
+
+        def _shortcut_yt_download(self):
+            if not self.is_busy:
+                self._switch_mode("yt_music")
+                self.trigger_yt_download()
             return True
 
         def _shortcut_quit(self):
@@ -515,6 +763,24 @@ class GuiApp
                     path = folder.get_path()
                     if path:
                         self.dest_entry.set_text(path)
+            except Exception:
+                pass
+
+        def _on_paste_url_clicked(self, _btn):
+            try:
+                display = Gdk.Display.get_default()
+                if display:
+                    clipboard = display.get_clipboard()
+                    clipboard.read_text_async(None, self._on_clipboard_text_ready)
+            except Exception:
+                pass
+
+        def _on_clipboard_text_ready(self, clipboard, result):
+            try:
+                text = clipboard.read_text_finish(result)
+                if text:
+                    self.yt_url_entry.set_text(text.strip())
+                    self.yt_url_entry.grab_focus()
             except Exception:
                 pass
 
@@ -664,6 +930,22 @@ class GuiApp
                 "drives": drives_payload,
             })
 
+        def trigger_yt_download(self):
+            if self.is_busy:
+                return
+            url = self.yt_url_entry.get_text().strip()
+            if not url:
+                self.status_label.set_text("Please paste a YouTube Music album or playlist URL first.")
+                self.yt_url_entry.grab_focus()
+                return
+            dest = self.dest_entry.get_text().strip() or self.destination
+            self._set_busy_state(True, "Starting YouTube Music download...")
+            self._send_ipc({
+                "action": "start_yt_download",
+                "url": url,
+                "destination": dest,
+            })
+
         def _set_busy_state(self, busy, status_msg=None):
             self.is_busy = busy
             self.refresh_btn.set_sensitive(not busy)
@@ -671,6 +953,10 @@ class GuiApp
             self.start_selected_btn.set_sensitive((not busy) and bool(self.drive_rows))
             self.dest_entry.set_sensitive(not busy)
             self.browse_btn.set_sensitive(not busy)
+            self.yt_url_entry.set_sensitive(not busy)
+            self.yt_paste_btn.set_sensitive(not busy)
+            self.yt_clear_btn.set_sensitive(not busy)
+            self.yt_download_btn.set_sensitive(not busy)
 
             for widgets in self.drive_rows.values():
                 widgets["check"].set_sensitive(not busy)
@@ -732,7 +1018,7 @@ class GuiApp
                 if ev == "drive_start":
                     self._pulsing_mode = True
                     self.status_label.set_text(f"[{idx}/{total}] Processing {drive}...")
-                    self.progress_bar.set_text(f"Drive {idx}/{total}: {drive}")
+                    self.progress_bar.set_text(f"{drive}")
                     self.append_log(text)
                 elif ev == "log":
                     if fraction is not None:
@@ -749,7 +1035,7 @@ class GuiApp
                     self._pulsing_mode = False
                     if fraction is not None:
                         self.progress_bar.set_fraction(float(fraction))
-                    self.status_label.set_text(f"[{idx}/{total}] Finished & ejected {drive}")
+                    self.status_label.set_text(f"[{idx}/{total}] Finished {drive}")
                     self.append_log(text)
                 elif ev == "error":
                     self._pulsing_mode = False
@@ -788,6 +1074,15 @@ class GuiApp
                 assert "sr0" in payload and "sr1" in payload
                 assert payload["sr0"]["author"] == "Unknown"
                 self.populate_drives({})
+
+            # Verify switching to YouTube Music mode and URL widgets
+            self._switch_mode("yt_music")
+            assert self.view_stack.get_visible_child_name() == "yt_music"
+            self.yt_url_entry.set_text("https://music.youtube.com/playlist?list=OLAK5uy_test")
+            assert self.yt_url_entry.get_text() == "https://music.youtube.com/playlist?list=OLAK5uy_test"
+            self.yt_url_entry.set_text("")
+            self._switch_mode("cd")
+            assert self.view_stack.get_visible_child_name() == "cd"
 
             self._send_ipc({
                 "action": "self_test_complete",

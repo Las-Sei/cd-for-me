@@ -11,8 +11,9 @@ module UsbAccessor
     return {} if output.empty?
 
     devices = output.split("\n").map(&:strip).reject(&:empty?)
+    devices.reject! { |device| device.include?("cannot access") || device.include?("No such file") }
 
-    devices.map {|device| [File.basename(device), { path: device }]}.to_h
+    devices.map { |device| [File.basename(device), { path: device }] }.to_h
   end
 
   def get_mountpoints(devices)
@@ -22,17 +23,19 @@ module UsbAccessor
   end
 
   def copy_drives(drives:, destination:, &on_progress)
+    return if drives.nil? || drives.empty?
+
     drives.each do |drive, attrs|
       author = attrs[:author].to_s.strip
       author = "Unknown" if author.empty?
       attrs[:author] = author
 
-      name = attrs[:name].to_s.strip
-      name = Time.now.strftime("%H:%M:%S_%m:%d:%Y") if name.empty?
+      raw_name = attrs[:name].to_s.strip
+      name = raw_name.empty? ? Time.now.strftime("%H:%M:%S_%m:%d:%Y") : raw_name
       attrs[:name] = name
 
       target_dir = Pathname.new(destination)
-        .join(attrs[:author])
+        .join(author)
         .join(name)
         .expand_path
       target_dir.dirname.mkpath
@@ -54,7 +57,7 @@ module UsbAccessor
             on_progress.call({ event: :log, drive: drive, attrs: attrs, message: line })
           end
         else
-          SystemRunner.run("rsync -av", attrs[:mountpoint].to_s + "/", target_dir)
+          SystemRunner.run("rsync -av", attrs[:mountpoint] + "/", target_dir)
         end
       elsif attrs.fetch(:type) == :audio
         if block_given?
