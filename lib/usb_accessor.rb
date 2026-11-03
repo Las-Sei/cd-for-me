@@ -7,16 +7,24 @@ module UsbAccessor
   extend self
 
   def list_drives
-    devices = SystemRunner.run("ls /dev/sr*").split("\n")
+    output = SystemRunner.run("ls /dev/sr*").to_s.strip
+    return {} if output.empty?
 
-    devices.map {|device| [File.basename(device), { path: device }]}.to_h
+    devices = output.split("\n").map(&:strip).reject(&:empty?)
+    devices.reject! { |device| device.include?("cannot access") || device.include?("No such file") }
+
+    devices.map { |device| [File.basename(device), { path: device }] }.to_h
   end
 
   def get_mountpoints(devices)
+    return {} if devices.nil? || devices.empty?
+
     get_data_mountpoints(devices).merge(get_audio_mountpoints(devices))
   end
 
   def copy_drives(drives:, destination:)
+    return if drives.nil? || drives.empty?
+
     drives.each do |drive, attrs|
       name = attrs[:name] ||= Time.now.strftime("%H:%M:%S_%m:%d:%Y")
 
@@ -46,6 +54,8 @@ module UsbAccessor
   end
 
   def get_data_mountpoints(devices)
+    return {} if devices.nil? || devices.empty?
+
     drives = devices.keys
 
     mounts_raw = SystemRunner.run("lsblk -o NAME,MOUNTPOINTS | grep", *drives).split("\n")
@@ -68,6 +78,8 @@ module UsbAccessor
   end
 
   def get_audio_mountpoints(devices)
+    return {} if devices.nil? || devices.empty?
+
     drives = devices.keys
 
     mounts_raw = SystemRunner.run("gio mount -l | grep -E '#{ [*drives].join("|")}'").split("\n")
@@ -77,8 +89,9 @@ module UsbAccessor
 
     audio_mounts = audio_mounts.map do |mount|
       mounted_drive = drives.find {mount == _1}
+      next unless mounted_drive && devices[mount]
 
       [mounted_drive, { drive: devices[mount][:path], type: :audio }]
-    end.to_h
+    end.compact.to_h
   end
 end
