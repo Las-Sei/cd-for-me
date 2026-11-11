@@ -1,4 +1,5 @@
 require "pathname"
+require "shellwords"
 require "time"
 
 require_relative 'system_runner'
@@ -52,25 +53,30 @@ module UsbAccessor
 
       success = true
       if attrs.fetch(:type) == :mp3
+        source_dir = Shellwords.escape("#{attrs[:mountpoint]}/")
+        escaped_target_dir = Shellwords.escape(target_dir.to_s)
         if block_given?
-          success = SystemRunner.run_stream("rsync -av", attrs[:mountpoint].to_s + "/", target_dir) do |line|
+          success = SystemRunner.run_stream("rsync -av", source_dir, escaped_target_dir) do |line|
             on_progress.call({ event: :log, drive: drive, attrs: attrs, message: line })
           end
         else
-          SystemRunner.run("rsync -av", attrs[:mountpoint] + "/", target_dir)
+          SystemRunner.run("rsync -av", source_dir, escaped_target_dir)
         end
       elsif attrs.fetch(:type) == :audio
+        escaped_target_dir = Shellwords.escape(target_dir.to_s)
+        escaped_drive = Shellwords.escape(attrs[:drive].to_s)
         if block_given?
-          success = SystemRunner.run_stream("OUTPUTDIR='#{target_dir}'","abcde -d", attrs[:drive],"-o mp3 -c './.abcde.conf'") do |line|
+          success = SystemRunner.run_stream("OUTPUTDIR=#{escaped_target_dir}", "abcde -d", escaped_drive, "-o mp3 -c './.abcde.conf'") do |line|
             on_progress.call({ event: :log, drive: drive, attrs: attrs, message: line })
           end
         else
-          SystemRunner.run("OUTPUTDIR='#{target_dir}'","abcde -d", attrs[:drive],"-o mp3 -c './.abcde.conf'")
+          SystemRunner.run("OUTPUTDIR=#{escaped_target_dir}", "abcde -d", escaped_drive, "-o mp3 -c './.abcde.conf'")
         end
       end
 
+      escaped_drive = Shellwords.escape(attrs[:drive].to_s)
       if block_given?
-        SystemRunner.run_stream("eject", attrs[:drive]) do |line|
+        SystemRunner.run_stream("eject", escaped_drive) do |line|
           on_progress.call({ event: :log, drive: drive, attrs: attrs, message: line })
         end
         if success
@@ -91,7 +97,7 @@ module UsbAccessor
           })
         end
       else
-        SystemRunner.run("eject", attrs[:drive])
+        SystemRunner.run("eject", escaped_drive)
       end
 
     end
@@ -109,16 +115,16 @@ module UsbAccessor
     drives = devices.keys
     return {} if drives.empty?
 
-    mounts_raw = SystemRunner.run("lsblk -o NAME,MOUNTPOINTS | grep", *drives).split("\n")
+    mounts_raw = SystemRunner.run("lsblk -o NAME,MOUNTPOINTS | grep -E '#{[*drives].join("|")}'").split("\n")
     # Audio CDs haben keinen Mountpoint
     
-    drive_mounts = mounts_raw.map {_1.split.append("").take(2)}.to_h
+    drive_mounts = mounts_raw.map { _1.strip.split(/\s+/, 2).append("").take(2) }.to_h
     drive_mounts.select! { |drive, mount| mount != "" }
     drive_mounts.each_with_object({}) do |(drive, mount), result|
-      filenames = SystemRunner.run("ls -l", mount, "| sed '1d'").split("\n")
+      filenames = SystemRunner.run("ls -l", Shellwords.escape(mount), "| sed '1d'").split("\n")
       # |sed '1d' verhindet das die erste zeile angezeigt wird, die zeigt die summe des belegten speichers
       # -r-------- 1 lasse lasse  766498 Apr 25  2024 9783844551860_054_054.mp3
-      types = filenames.map {_1.split.last.split(".").last}.uniq
+      types = filenames.reject(&:empty?).filter_map { _1.split.last&.split(".")&.last&.downcase }.uniq
 
       type = types.length == 1 && types.first == "mp3" ? :mp3 : :data
       clean_drive = drive.sub(/\A[^a-zA-Z0-9]+/, "")

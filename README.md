@@ -52,4 +52,4 @@ Presents an interactive terminal menu to choose between:
 
 ## AI
 
-All code is 100% human written execpt for abcde.conf because I couldn't be bothered to reduce the template of andrews-corner to options regarding mp3 by hand :)
+The branches that are not main are mostly AI generated 
